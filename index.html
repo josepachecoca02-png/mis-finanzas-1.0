@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Mis Finanzas — Jose</title>
+    <!-- React & ReactDOM CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <!-- Babel CDN for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Supabase JS Client CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+        body { font-family: 'Plus Jakarta Sans', sans-serif; -webkit-tap-highlight-color: transparent; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #0a0a0a; }
+        ::-webkit-scrollbar-thumb { background: #262626; border-radius: 4px; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
+</head>
+<body class="bg-black text-neutral-100 min-h-screen pb-20 md:pb-0 select-none">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // 🔑 Credenciales incrustadas de Supabase
+        const SUPABASE_URL = "https://qdwqxnuccqzmkzffqlun.supabase.co";
+        const SUPABASE_ANON_KEY = "sb_publishable_3raAVklcVTD0xtDGTPntHA_VrtJ9u_H";
+
+        // Hash SHA-256 precalculado para el PIN 150624
+        const PIN_HASH_PREDETERMINADO = "01d36c1a84f5be6ad0cfbd45137eb152e724cf65c4cd98a6eb792fffa70b9ce4";
+
+        const obtenerFechaHoraActual = () => {
+            const ahora = new Date();
+            ahora.setMinutes(ahora.getMinutes() - ahora.getTimezoneOffset());
+            return ahora.toISOString().slice(0, 16);
+        };
+
+        const obtenerFechaHoy = () => {
+            return new Date().toISOString().slice(0, 10);
+        };
+
+        const hashPin = async (pin) => {
+            const msgUint8 = new TextEncoder().encode(pin + "_salt_jose_finanzas");
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        };
+
+        const CUENTAS_PREDETERMINADAS = [
+            { id: "c1", nombre: "Daviplata", tipo: "Billetera Digital", saldo: 0, activa: true },
+            { id: "c2", nombre: "Nequi", tipo: "Billetera Digital", saldo: 0, activa: true },
+            { id: "c3", nombre: "Bancolombia", tipo: "Banco", saldo: 0, activa: true },
+            { id: "c4", nombre: "Efectivo", tipo: "Efectivo", saldo: 0, activa: true },
+            { id: "c5", nombre: "Binance", tipo: "Inversión", saldo: 0, activa: true }
+        ];
+
+        const ESTADO_INICIAL = {
+            pinHash: PIN_HASH_PREDETERMINADO,
+            cuentas: CUENTAS_PREDETERMINADAS,
+            deudas: [],
+            porCobrar: [],
+            movimientos: [],
+            destinaciones: [],
+            cierresMensuales: []
+        };
+
+        function Aplicacion() {
+            const [datos, setDatos] = useState(() => {
+                try {
+                    const guardado = localStorage.getItem('mis_finanzas_jose_v22');
+                    if (guardado) {
+                        const parsed = JSON.parse(guardado);
+                        if (!parsed.cuentas || parsed.cuentas.length === 0) parsed.cuentas = CUENTAS_PREDETERMINADAS;
+                        if (!parsed.pinHash) parsed.pinHash = PIN_HASH_PREDETERMINADO;
+                        return parsed;
+                    }
+                    return ESTADO_INICIAL;
+                } catch(e) { return ESTADO_INICIAL; }
+            });
+
+            const [autenticado, setAutenticado] = useState(() => {
+                return localStorage.getItem('mis_finanzas_sesion_activa') === 'true';
+            });
+            const [inputPin, setInputPin] = useState('');
+            const [recordarDispositivo, setRecordarDispositivo] = useState(true);
+            const [errorPin, setErrorPin] = useState('');
+            const [ocultarSaldos, setOcultarSaldos] = useState(false);
+
+            const [estadoSincro, setEstadoSincro] = useState('espera');
+            const [rubroActivo, setRubroActivo] = useState('inicio');
+            const [modalVisible, setModalVisible] = useState(null);
+            const [notificacion, setNotificacion] = useState(null);
+
+            const [busquedaMov, setBusquedaMov] = useState('');
+            const [filtroFechaMov, setFiltroFechaMov] = useState('todos');
+
+            const clienteSupabase = useRef(null);
+
+            const mostrarNotificacion = (mensaje, tipo = 'exito') => {
+                setNotificacion({ mensaje, tipo });
+                setTimeout(() => setNotificacion(null), 3000);
+            };
+
+            useEffect(() => {
+                try {
+                    if (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY) {
+                        clienteSupabase.current = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                        cargarDesdeSupabase();
+                    } else {
+                        setEstadoSincro('error');
+                    }
+                } catch(e) {
+                    console.error("Error al conectar Supabase:", e);
+                    setEstadoSincro('error');
+                }
+            }, []);
+
+            useEffect(() => {
+                try {
+                    localStorage.setItem('mis_finanzas_jose_v22', JSON.stringify(datos));
+                } catch(e) {}
+            }, [datos]);
+
+            const cargarDesdeSupabase = async () => {
+                if (!clienteSupabase.current) return;
+                setEstadoSincro('sincronizando');
+                try {
+                    const { data: respuesta, error } = await clienteSupabase.current
+                        .from('app_data')
+                        .select('content')
+                        .eq('id', 'jose_finanzas')
+                        .single();
+
+                    if (error && error.code !== 'PGRST116') {
+                        console.error("Error Supabase:", error);
+                        setEstadoSincro('error');
+                        return;
+                    }
+
+                    if (respuesta && respuesta.content && typeof respuesta.content === 'object' && Object.keys(respuesta.content).length > 0) {
+                        const remoto = respuesta.content;
+                        if (!remoto.cuentas || remoto.cuentas.length === 0) remoto.cuentas = CUENTAS_PREDETERMINADAS;
+                        if (!remoto.pinHash) remoto.pinHash = PIN_HASH_PREDETERMINADO;
+                        setDatos(remoto);
+                        setEstadoSincro('exito');
+                    } else {
+                        guardarEnSupabase(datos);
+                    }
+                } catch(err) {
+                    console.error("Excepción al cargar:", err);
+                    setEstadoSincro('error');
+                }
+            };
+
+            const guardarEnSupabase = async (nuevosDatos) => {
+                if (!clienteSupabase.current) return;
+                setEstadoSincro('sincronizando');
+                try {
+                    const { error } = await clienteSupabase.current
+                        .from('app_data')
+                        .upsert({ id: 'jose_finanzas', content: nuevosDatos, updated_at: new Date() });
+
+                    if (!error) {
+                        setEstadoSincro('exito');
+                    } else {
+                        console.error("Error al upsert:", error);
+                        setEstadoSincro('error');
+                    }
+                } catch(err) {
+                    console.error("Excepción al guardar:", err);
+                    setEstadoSincro('error');
+                }
+            };
+
+            const actualizarYGuardar = (nuevosDatos) => {
+                setDatos(nuevosDatos);
+                guardarEnSupabase(nuevosDatos);
+            };
+
+            const manejarVerificacionPin = async (e) => {
+                e.preventDefault();
+                if (inputPin.length < 4) return setErrorPin('El PIN debe tener entre 4 y 6 dígitos');
+
+                const h = await hashPin(inputPin);
+                const targetHash = datos.pinHash || PIN_HASH_PREDETERMINADO;
+
+                if (h === targetHash) {
+                    setAutenticado(true);
+                    setErrorPin('');
+                    if (recordarDispositivo) {
+                        localStorage.setItem('mis_finanzas_sesion_activa', 'true');
+                    } else {
+                        localStorage.removeItem('mis_finanzas_sesion_activa');
+                    }
+                } else {
+                    setErrorPin('❌ PIN incorrecto');
+                    setInputPin('');
+                }
+            };
+
+            const bloquearSesion = () => {
+                setAutenticado(false);
+                setInputPin('');
+                localStorage.removeItem('mis_finanzas_sesion_activa');
+                mostrarNotificacion("🔒 Sesión bloqueada");
+            };
+
+            const formatearMoneda = (valor) => {
+                if (ocultarSaldos) return '••••••';
+                return '$' + (valor || 0).toLocaleString('es-CO');
+            };
+
+            const formatearFechaHora = (cadenaFecha) => {
+                if (!cadenaFecha) return '';
+                const d = new Date(cadenaFecha);
+                return d.toLocaleString('es-CO', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true });
+            };
+
+            const listaCuentas = useMemo(() => {
+                return (datos?.cuentas && datos.cuentas.length > 0) ? datos.cuentas : CUENTAS_PREDETERMINADAS;
+            }, [datos]);
+
+            const totales = useMemo(() => {
+                const cuentas = listaCuentas;
+                const destinaciones = datos?.destinaciones || [];
+                const porCobrarLista = datos?.porCobrar || [];
+                const deudasLista = datos?.deudas || [];
+
+                const saldoBruto = cuentas.filter(c => c.tipo !== 'Inversión').reduce((acc, c) => acc + (c.activa !== false ? c.saldo : 0), 0);
+                const inversiones = cuentas.filter(c => c.tipo === 'Inversión').reduce((acc, c) => acc + (c.activa !== false ? c.saldo : 0), 0);
+                const totalDestinado = destinaciones.reduce((acc, d) => acc + (d.monto || 0), 0);
+                
+                const disponibleReal = Math.max(0, saldoBruto - totalDestinado);
+
+                const porCobrar = porCobrarLista.reduce((acc, r) => acc + Math.max(0, r.montoOriginal - ((r.abonos || []).reduce((pAcc, p) => pAcc + p.monto, 0))), 0);
+                const deudas = deudasLista.reduce((acc, d) => acc + Math.max(0, d.montoOriginal - ((d.abonos || []).reduce((pAcc, p) => pAcc + p.monto, 0))), 0);
+                const patrimonioNeto = disponibleReal + inversiones + totalDestinado + porCobrar - deudas;
+
+                return { saldoBruto, totalDestinado, disponibleReal, inversiones, porCobrar, deudas, patrimonioNeto };
+            }, [datos, listaCuentas]);
+
+            // Formularios
+            const [formMov, setFormMov] = useState({ id: null, concepto: '', monto: '', cuentaId: 'c1', tipo: 'ingreso', categoria: 'General', fechaHora: obtenerFechaHoraActual() });
+            const [formTransfer, setFormTransfer] = useState({ cuentaOrigenId: 'c3', cuentaDestinoId: 'c2', monto: '', concepto: 'Transferencia propia', fechaHora: obtenerFechaHoraActual() });
+            const [formAjusteSaldo, setFormAjusteSaldo] = useState({ cuentaId: 'c1', nuevoSaldo: '' });
+            const [formDestino, setFormDestino] = useState({ id: null, nombre: '', monto: '', descripcion: '' });
+            const [formEjecutarDestino, setFormEjecutarDestino] = useState({ destinacionId: '', cuentaId: 'c1', monto: '', fechaHora: obtenerFechaHoraActual() });
+            const [formDeuda, setFormDeuda] = useState({ id: null, entidad: '', concepto: '', montoOriginal: '', fechaVencimiento: '', fechaHora: obtenerFechaHoraActual() });
+            const [formAbonoDeuda, setFormAbonoDeuda] = useState({ deudaId: '', cuentaId: 'c1', monto: '', fechaHora: obtenerFechaHoraActual() });
+            const [formPorCobrar, setFormPorCobrar] = useState({ id: null, deudor: '', concepto: '', montoOriginal: '', fechaAcordada: '', fechaHora: obtenerFechaHoraActual() });
+            const [formAbonoCobro, setFormAbonoCobro] = useState({ cobroId: '', cuentaId: 'c1', monto: '', fechaHora: obtenerFechaHoraActual() });
+            const [nombreCierre, setNombreCierre] = useState('');
+
+            // Operaciones
+            const guardarMovimiento = (e) => {
+                e.preventDefault();
+                const montoNum = parseFloat(formMov.monto);
+                if (isNaN(montoNum) || montoNum <= 0) return mostrarNotificacion("Ingresa un monto válido", 'error');
+
+                let cuentasAct = [...listaCuentas];
+                let movsAct = [...(datos.movimientos || [])];
+
+                if (formMov.id) {
+                    const movAnt = movsAct.find(m => m.id === formMov.id);
+                    cuentasAct = cuentasAct.map(c => {
+                        let saldoTemp = c.saldo;
+                        if (movAnt && c.id === movAnt.cuentaId) {
+                            saldoTemp = movAnt.tipo === 'ingreso' ? saldoTemp - movAnt.monto : saldoTemp + movAnt.monto;
+                        }
+                        if (c.id === formMov.cuentaId) {
+                            saldoTemp = formMov.tipo === 'ingreso' ? saldoTemp + montoNum : saldoTemp - montoNum;
+                        }
+                        return { ...c, saldo: saldoTemp };
+                    });
+                    movsAct = movsAct.map(m => m.id === formMov.id ? { ...m, fechaHora: formMov.fechaHora, concepto: formMov.concepto, monto: montoNum, tipo: formMov.tipo, cuentaId: formMov.cuentaId, categoria: formMov.categoria } : m);
+                } else {
+                    cuentasAct = cuentasAct.map(c => c.id === formMov.cuentaId ? { ...c, saldo: formMov.tipo === 'ingreso' ? c.saldo + montoNum : c.saldo - montoNum } : c);
+                    const nuevoMov = { id: 'm_' + Date.now(), fechaHora: formMov.fechaHora || obtenerFechaHoraActual(), concepto: formMov.concepto, monto: montoNum, tipo: formMov.tipo, cuentaId: formMov.cuentaId, categoria: formMov.categoria };
+                    movsAct = [nuevoMov, ...movsAct];
+                }
+
+                actualizarYGuardar({ ...datos, cuentas: cuentasAct, movimientos: movsAct });
+                setModalVisible(null);
+                mostrarNotificacion("✅ Movimiento guardado exitosamente");
+            };
+
+            const realizarTransferencia = (e) => {
+                e.preventDefault();
+                const montoNum = parseFloat(formTransfer.monto);
+                if (isNaN(montoNum) || montoNum <= 0) return mostrarNotificacion("Monto de transferencia inválido", 'error');
+                if (formTransfer.cuentaOrigenId === formTransfer.cuentaDestinoId) return mostrarNotificacion("Las cuentas deben ser diferentes", 'error');
+
+                const origen = listaCuentas.find(c => c.id === formTransfer.cuentaOrigenId);
+                const destino = listaCuentas.find(c => c.id === formTransfer.cuentaDestinoId);
+
+                const cuentasAct = listaCuentas.map(c => {
+                    if (c.id === formTransfer.cuentaOrigenId) return { ...c, saldo: c.saldo - montoNum };
+                    if (c.id === formTransfer.cuentaDestinoId) return { ...c, saldo: c.saldo + montoNum };
+                    return c;
+                });
+
+                const nuevoMov = {
+                    id: 'm_tr_' + Date.now(),
+                    fechaHora: formTransfer.fechaHora || obtenerFechaHoraActual(),
+                    concepto: `⇄ ${formTransfer.concepto} (${origen?.nombre} ➔ ${destino?.nombre})`,
+                    monto: montoNum,
+                    tipo: 'transferencia',
+                    cuentaId: formTransfer.cuentaOrigenId,
+                    categoria: 'Transferencia'
+                };
+
+                actualizarYGuardar({ ...datos, cuentas: cuentasAct, movimientos: [nuevoMov, ...(datos.movimientos || [])] });
+                setModalVisible(null);
+                mostrarNotificacion("✅ Transferencia realizada con éxito");
+            };
+
+            const guardarAjusteSaldo = (e) => {
+                e.preventDefault();
+                const nuevoSaldoNum = parseFloat(formAjusteSaldo.nuevoSaldo);
+                if (isNaN(nuevoSaldoNum)) return mostrarNotificacion("Ingresa un saldo válido", 'error');
+
+                const cuentasAct = listaCuentas.map(c => c.id === formAjusteSaldo.cuentaId ? { ...c, saldo: nuevoSaldoNum } : c);
+                actualizarYGuardar({ ...datos, cuentas: cuentasAct });
+                setModalVisible(null);
+                mostrarNotificacion("✅ Saldo calibrado correctamente");
+            };
+
+            const eliminarMovimiento = (id) => {
+                if (!confirm("¿Eliminar este movimiento?")) return;
+                const movs = datos.movimientos || [];
+                const mov = movs.find(m => m.id === id);
+                if (!mov) return;
+                const cuentasAct = listaCuentas.map(c => c.id === mov.cuentaId ? { ...c, saldo: mov.tipo === 'ingreso' ? c.saldo - mov.monto : mov.tipo === 'egreso' ? c.saldo + mov.monto : c.saldo } : c);
+                actualizarYGuardar({ ...datos, cuentas: cuentasAct, movimientos: movs.filter(m => m.id !== id) });
+                mostrarNotificacion("🗑️ Movimiento eliminado");
+            };
+
+            const guardarDestinacion = (e) => {
+                e.preventDefault();
+                const montoNum = parseFloat(formDestino.monto) || 0;
+                let lista = [...(datos.destinaciones || [])];
+                if (formDestino.id) {
+                    lista = lista.map(d => d.id === formDestino.id ? { ...d, nombre: formDestino.nombre, monto: montoNum, descripcion: formDestino.descripcion } : d);
+                } else {
+                    lista.push({ id: 'dest_' + Date.now(), nombre: formDestino.nombre, monto: montoNum, descripcion: formDestino.descripcion });
+                }
+                actualizarYGuardar({ ...datos, destinaciones: lista });
+                setModalVisible(null);
+                mostrarNotificacion("✅ Destinación guardada");
+            };
+
+            const ejecutarPagoDestinacion = (e) => {
+                e.preventDefault();
+                const montoNum = parseFloat(formEjecutarDestino.monto);
+                if (isNaN(montoNum) || montoNum <= 0) return mostrarNotificacion("Ingresa un monto válido", 'error');
+
+                const destinacion = (datos.destinaciones || []).find(d => d.id === formEjecutarDestino.destinacionId);
+                if (!destinacion) return;
+
+                const cuentasAct = listaCuentas.map(c => c.id === formEjecutarDestino.cuentaId ? { ...c, saldo: c.saldo - montoNum } : c);
+
+                const nuevoMov = {
+                    id: 'm_' + Date.now(),
+                    fechaHora: formEjecutarDestino.fechaHora || obtenerFechaHoraActual(),
+                    concepto: `🎯 Fondo Pagado: ${destinacion.nombre}`,
+                    monto: montoNum,
+                    tipo: 'egreso',
+                    cuentaId: formEjecutarDestino.cuentaId,
+                    categoria: 'Gasto Destinado'
+                };
+
+                let destinacionesAct = [];
+                if (montoNum >= destinacion.monto) {
+                    destinacionesAct = (datos.destinaciones || []).filter(d => d.id !== formEjecutarDestino.destinacionId);
+                } else {
+                    destinacionesAct = (datos.destinaciones || []).map(d => d.id === formEjecutarDestino.destinacionId ? { ...d, monto: d.monto - montoNum } : d);
+                }
+
+                actualizarYGuardar({
+                    ...datos,
+                    cuentas: cuentasAct,
+                    destinaciones: destinacionesAct,
+                    movimientos: [nuevoMov, ...(datos.movimientos || [])]
+                });
+
+                setModalVisible(null);
+                mostrarNotificacion("⚡ Gasto ejecutado y trazabilidad registrada");
+            };
+
+            const eliminarDestinacion = (id) => {
+                if (!confirm("¿Eliminar esta destinación sin ejecutar el gasto?")) return;
+                actualizarYGuardar({ ...datos, destinaciones: (datos.destinaciones || []).filter(d => d.id !== id) });
+                mostrarNotificacion("🗑️ Destinación eliminada");
+            };
+
+            const guardarDeuda = (e) => {
+                e.preventDefault();
+                const orig = parseFloat(formDeuda.montoOriginal) || 0;
+                let lista = [...(datos.deudas || [])];
+                if (formDeuda.id) {
+                    lista = lista.map(d => d.id === formDeuda.id ? { ...d, entidad: formDeuda.entidad, concepto: formDeuda.concepto, montoOriginal: orig, fechaVencimiento: formDeuda.fechaVencimiento, fechaHora: formDeuda.fechaHora } : d);
+                } else {
+                    lista.push({ id: 'd_' + Date.now(), entidad: formDeuda.entidad, concepto: formDeuda.concepto, montoOriginal: orig, fechaVencimiento: formDeuda.fechaVencimiento, fechaHora: formDeuda.fechaHora || obtenerFechaHoraActual(), abonos: [] });
+                }
+                actualizarYGuardar({ ...datos, deudas: lista });
+                setModalVisible(null);
+                mostrarNotificacion("✅ Deuda registrada");
+            };
+
+            const eliminarDeuda = (id) => {
+                if (!confirm("¿Eliminar esta deuda?")) return;
+                actualizarYGuardar({ ...datos, deudas: (datos.deudas || []).filter(d => d.id !== id) });
+                mostrarNotificacion("🗑️ Deuda eliminada");
+            };
+
+            const abonarDeuda = (e) => {
+                e.preventDefault();
+                const montoNum = parseFloat(formAbonoDeuda.monto);
+                if (isNaN(montoNum) || montoNum <= 0) return mostrarNotificacion("Monto inválido", 'error');
+
+                const cuentasAct = listaCuentas.map(c => c.id === formAbonoDeuda.cuentaId ? { ...c, saldo: c.saldo - montoNum } : c);
+                const deudasAct = (datos.deudas || []).map(d => {
+                    if (d.id === formAbonoDeuda.deudaId) {
+                        return { ...d, abonos: [...(d.abonos || []), { id: 'ab_' + Date.now(), monto: montoNum, fechaHora: formAbonoDeuda.fechaHora || obtenerFechaHoraActual(), cuentaId: formAbonoDeuda.cuentaId }] };
+                    }
+                    return d;
+                });
+                const nuevoMov = { id: 'm_' + Date.now(), fechaHora: formAbonoDeuda.fechaHora || obtenerFechaHoraActual(), concepto: `Abono Deuda: ${(datos.deudas || []).find(d => d.id === formAbonoDeuda.deudaId)?.entidad || ''}`, monto: montoNum, tipo: 'egreso', cuentaId: formAbonoDeuda.cuentaId, categoria: 'Pago de Deuda' };
+
+                actualizarYGuardar({ ...datos, cuentas: cuentasAct, deudas: deudasAct, movimientos: [nuevoMov, ...(datos.movimientos || [])] });
+                setModalVisible(null);
+                mostrarNotificacion("✅ Abono a deuda registrado");
+            };
+
+            const guardarPorCobrar = (e) => {
+                e.preventDefault();
+                const orig = parseFloat(formPorCobrar.montoOriginal) || 0;
+                let lista = [...(datos.porCobrar || [])];
+                if (formPorCobrar.id) {
+                    lista = lista.map(r => r.id === formPorCobrar.id ? { ...r, deudor: formPorCobrar.deudor, concepto: formPorCobrar.concepto, montoOriginal: orig, fechaAcordada: formPorCobrar.fechaAcordada, fechaHora: formPorCobrar.fechaHora } : r);
+                } else {
+                    lista.push({ id: 'r_' + Date.now(), deudor: formPorCobrar.deudor, concepto: formPorCobrar.concepto, montoOriginal: orig, fechaAcordada: formPorCobrar.fechaAcordada, fechaHora: formPorCobrar.fechaHora || obtenerFechaHoraActual(), abonos: [] });
+                }
+                actualizarYGuardar({ ...datos, porCobrar: lista });
+                setModalVisible(null);
+                mostrarNotificacion("✅ Préstamo registrado");
+            };
+
+            const eliminarPorCobrar = (id) => {
+                if (!confirm("¿Eliminar este préstamo?")) return;
+                actualizarYGuardar({ ...datos, porCobrar: (datos.porCobrar || []).filter(r => r.id !== id) });
+                mostrarNotificacion("🗑️ Préstamo eliminado");
+            };
+
+            const recibirAbonoCobro = (e) => {
+                e.preventDefault();
+                const montoNum = parseFloat(formAbonoCobro.monto);
+                if (isNaN(montoNum) || montoNum <= 0) return mostrarNotificacion("Monto inválido", 'error');
+
+                const cuentasAct = listaCuentas.map(c => c.id === formAbonoCobro.cuentaId ? { ...c, saldo: c.saldo + montoNum } : c);
+                const cobrosAct = (datos.porCobrar || []).map(r => {
+                    if (r.id === formAbonoCobro.cobroId) {
+                        return { ...r, abonos: [...(r.abonos || []), { id: 'rab_' + Date.now(), monto: montoNum, fechaHora: formAbonoCobro.fechaHora || obtenerFechaHoraActual(), cuentaId: formAbonoCobro.cuentaId }] };
+                    }
+                    return r;
+                });
+                const nuevoMov = { id: 'm_' + Date.now(), fechaHora: formAbonoCobro.fechaHora || obtenerFechaHoraActual(), concepto: `Abono Recibido: ${(datos.porCobrar || []).find(r => r.id === formAbonoCobro.cobroId)?.deudor || ''}`, monto: montoNum, tipo: 'ingreso', cuentaId: formAbonoCobro.cuentaId, categoria: 'Cobro de Préstamo' };
+
+                actualizarYGuardar({ ...datos, cuentas: cuentasAct, porCobrar: cobrosAct, movimientos: [nuevoMov, ...(datos.movimientos || [])] });
+                setModalVisible(null);
+                mostrarNotificacion("✅ Cobro registrado");
+            };
+
+            const realizarCierreMensual = (e) => {
+                e.preventDefault();
+                if (!nombreCierre.trim()) return mostrarNotificacion("Ingresa un nombre para el mes", 'error');
+
+                const registroCierre = {
+                    id: 'cierre_' + Date.now(),
+                    nombreMes: nombreCierre.trim(),
+                    fechaCierre: obtenerFechaHoraActual(),
+                    resumen: { ...totales }
+                };
+
+                const listaCierres = [registroCierre, ...(datos.cierresMensuales || [])];
+                actualizarYGuardar({ ...datos, cierresMensuales: listaCierres });
+                setNombreCierre('');
+                setModalVisible(null);
+                mostrarNotificacion("🔒 Cierre de mes guardado exitosamente");
+            };
+
+            const exportarCSV = () => {
+                const movs = datos.movimientos || [];
+                if (movs.length === 0) return mostrarNotificacion("No hay movimientos para exportar", 'error');
+
+                let csv = 'Fecha,Concepto,Tipo,Monto,Cuenta\n';
+                movs.forEach(m => {
+                    const c = listaCuentas.find(cta => cta.id === m.cuentaId)?.nombre || 'General';
+                    csv += `"${m.fechaHora}","${m.concepto}","${m.tipo}",${m.monto},"${c}"\n`;
+                });
+
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `Mis_Finanzas_Jose_${obtenerFechaHoy()}.csv`;
+                a.click();
+                mostrarNotificacion("📥 Reporte descargado en CSV");
+            };
+
+            const movimientosFiltrados = useMemo(() => {
+                let lista = datos.movimientos || [];
+
+                if (busquedaMov.trim()) {
+                    const q = busquedaMov.toLowerCase();
+                    lista = lista.filter(m => {
+                        const c = listaCuentas.find(cta => cta.id === m.cuentaId)?.nombre.toLowerCase() || '';
+                        return m.concepto.toLowerCase().includes(q) || c.includes(q);
+                    });
+                }
+
+                const ahora = new Date();
+                if (filtroFechaMov === 'mes_actual') {
+                    lista = lista.filter(m => {
+                        const d = new Date(m.fechaHora);
+                        return d.getMonth() === ahora.getMonth() && d.getFullYear() === ahora.getFullYear();
+                    });
+                } else if (filtroFechaMov === 'mes_anterior') {
+                    const mesAnt = ahora.getMonth() === 0 ? 11 : ahora.getMonth() - 1;
+                    const anoAnt = ahora.getMonth() === 0 ? ahora.getFullYear() - 1 : ahora.getFullYear();
+                    lista = lista.filter(m => {
+                        const d = new Date(m.fechaHora);
+                        return d.getMonth() === mesAnt && d.getFullYear() === anoAnt;
+                    });
+                } else if (filtroFechaMov === 'ano_actual') {
+                    lista = lista.filter(m => {
+                        const d = new Date(m.fechaHora);
+                        return d.getFullYear() === ahora.getFullYear();
+                    });
+                }
+
+                return lista;
+            }, [datos.movimientos, busquedaMov, filtroFechaMov, listaCuentas]);
+
+            const calcularAlertaVencimiento = (fechaVenc) => {
+                if (!fechaVenc) return null;
+                const hoy = new Date();
+                hoy.setHours(0,0,0,0);
+                const venc = new Date(fechaVenc);
+                venc.setHours(0,0,0,0);
+
+                const diffDays = Math.ceil((venc - hoy) / (1000 * 60 * 60 * 24));
+
+                if (diffDays < 0) return { texto: '🚨 Vencido', clase: 'bg-red-500/20 text-red-400 border-red-500/30' };
+                if (diffDays === 0) return { texto: '⚠️ Vence Hoy', clase: 'bg-amber-500/20 text-amber-400 border-amber-500/30' };
+                if (diffDays <= 5) return { texto: `⚠️ Vence en ${diffDays} días`, clase: 'bg-amber-500/20 text-amber-400 border-amber-500/30' };
+                return null;
+            };
+
+            const rubros = [
+                { id: 'inicio', etiqueta: '📊 Inicio', corto: 'Inicio', icono: '📊' },
+                { id: 'cuentas', etiqueta: '💳 Cuentas', corto: 'Cuentas', icono: '💳' },
+                { id: 'destinaciones', etiqueta: '🎯 Destinación de Fondos', corto: 'Destinos', icono: '🎯' },
+                { id: 'deudas', etiqueta: '🔴 Mis Deudas', corto: 'Deudas', icono: '🔴' },
+                { id: 'porCobrar', etiqueta: '🟢 Me Deben', corto: 'Me Deben', icono: '🟢' },
+                { id: 'movimientos', etiqueta: '📜 Movimientos', corto: 'Historial', icono: '📜' },
+                { id: 'cierres', etiqueta: '🔒 Cierre de Mes', corto: 'Cierres', icono: '🔒' }
+            ];
+
+            // 🔐 PANTALLA DE BLOQUEO POR PIN
+            if (!autenticado) {
+                return (
+                    <div className="min-h-screen bg-black text-white flex items-center justify-center p-4">
+                        <form onSubmit={manejarVerificacionPin} className="bg-neutral-900 border border-neutral-800 p-6 md:p-8 rounded-3xl max-w-xs w-full text-center space-y-6 shadow-2xl">
+                            <div className="w-16 h-16 bg-neutral-950 border border-neutral-800 rounded-2xl flex items-center justify-center text-3xl mx-auto">
+                                🚀
+                            </div>
+                            <div>
+                                <h2 className="text-xl font-bold">Mis Finanzas</h2>
+                                <p className="text-xs text-neutral-400 mt-1">Ingresa tu PIN de acceso</p>
+                            </div>
+
+                            <div className="space-y-3">
+                                <input
+                                    type="password"
+                                    maxLength="6"
+                                    autoFocus
+                                    required
+                                    placeholder="••••••"
+                                    value={inputPin}
+                                    onChange={e => { setErrorPin(''); setInputPin(e.target.value); }}
+                                    className="w-full bg-black border border-neutral-800 text-center text-2xl tracking-[0.4em] font-black py-3 rounded-2xl focus:outline-none focus:border-emerald-500 text-emerald-400"
+                                />
+                                {errorPin && <p className="text-xs text-red-500 font-bold">{errorPin}</p>}
+                            </div>
+
+                            <label className="flex items-center justify-center gap-2 text-xs text-neutral-400 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={recordarDispositivo}
+                                    onChange={e => setRecordarDispositivo(e.target.checked)}
+                                    className="rounded bg-black border-neutral-800 text-emerald-500 focus:ring-0"
+                                />
+                                Recordar este dispositivo
+                            </label>
+
+                            <button type="submit" className="w-full bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-extrabold py-3.5 rounded-2xl transition">
+                                Desbloquear
+                            </button>
+                        </form>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="flex flex-col min-h-screen bg-black text-neutral-100">
+                    
+                    {/* NOTIFICACIÓN TOAST */}
+                    {notificacion && (
+                        <div className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-xl font-bold text-xs shadow-2xl border backdrop-blur-md transition-all ${
+                            notificacion.tipo === 'exito' ? 'bg-emerald-950/90 text-emerald-400 border-emerald-500/40' : 'bg-red-950/90 text-red-400 border-red-500/40'
+                        }`}>
+                            {notificacion.mensaje}
+                        </div>
+                    )}
+
+                    {/* CABECERA SUPERIOR */}
+                    <header className="bg-neutral-950 border-b border-neutral-900 sticky top-0 z-30">
+                        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                                <div className="w-9 h-9 bg-neutral-900 border border-neutral-800 rounded-xl flex items-center justify-center text-xl">🚀</div>
+                                <div>
+                                    <h1 className="font-bold text-white text-base leading-none">Mis Finanzas</h1>
+                                    <span className="text-[10px] text-emerald-400 font-semibold">Jose Pacheco</span>
+                                </div>
+                            </div>
+
+                            <div className="flex items-center gap-1.5">
+                                <button onClick={() => setOcultarSaldos(!ocultarSaldos)} title="Ocultar/Mostrar saldos" className="bg-neutral-900 hover:bg-neutral-800 text-neutral-300 border border-neutral-800 p-2 rounded-xl text-xs font-bold transition">
+                                    {ocultarSaldos ? '👁️‍🗨️' : '👁️'}
+                                </button>
+                                <button onClick={bloquearSesion} title="Bloquear sesión" className="bg-neutral-900 hover:bg-neutral-800 text-neutral-300 border border-neutral-800 p-2 rounded-xl text-xs font-bold transition">
+                                    🔒
+                                </button>
+                                <button onClick={() => setModalVisible('transferencia')} className="bg-neutral-900 hover:bg-neutral-800 text-neutral-200 border border-neutral-800 px-2.5 py-2 rounded-xl text-xs font-bold transition">
+                                    ⇄ Transferir
+                                </button>
+                                <button onClick={() => { setFormMov({ id: null, concepto: '', monto: '', cuentaId: listaCuentas[0]?.id || 'c1', tipo: 'ingreso', categoria: 'General', fechaHora: obtenerFechaHoraActual() }); setModalVisible('movimiento'); }} className="bg-emerald-500 hover:bg-emerald-400 text-neutral-950 px-3 py-2 rounded-xl text-xs font-extrabold transition">
+                                    + Movimiento
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* RUBROS SUPERIORES DE NAVEGACIÓN PARA PC */}
+                        <div className="hidden md:block bg-neutral-950 border-t border-neutral-900/80">
+                            <div className="max-w-7xl mx-auto px-4 flex items-center justify-between gap-1 overflow-x-hidden">
+                                {rubros.map(r => (
+                                    <button
+                                        key={r.id}
+                                        onClick={() => setRubroActivo(r.id)}
+                                        className={`flex-1 py-3 px-2 text-center text-xs font-extrabold transition border-b-2 ${
+                                            rubroActivo === r.id ? 'border-emerald-500 text-emerald-400 bg-neutral-900/50' : 'border-transparent text-neutral-400 hover:text-white hover:bg-neutral-900/30'
+                                        }`}
+                                    >
+                                        {r.etiqueta}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* BARRA INFERIOR FIJA PARA CELULAR */}
+                    <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-neutral-950 border-t border-neutral-900 px-1 py-1.5 grid grid-cols-7 gap-0.5 z-40">
+                        {rubros.map(r => (
+                            <button
+                                key={r.id}
+                                onClick={() => setRubroActivo(r.id)}
+                                className={`flex flex-col items-center justify-center py-1 px-0.5 rounded-lg transition ${
+                                    rubroActivo === r.id ? 'text-emerald-400 bg-neutral-900 font-extrabold' : 'text-neutral-400 hover:text-neutral-200 font-medium'
+                                }`}
+                            >
+                                <span className="text-xs leading-none">{r.icono}</span>
+                                <span className="text-[8px] leading-tight mt-1 truncate w-full text-center">{r.corto}</span>
+                            </button>
+                        ))}
+                    </nav>
+
+                    {/* CONTENIDO PRINCIPAL */}
+                    <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 space-y-6">
+                        
+                        {/* INICIO */}
+                        {rubroActivo === 'inicio' && (
+                            <div className="space-y-4">
+                                <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
+                                    <span className="text-xs font-bold text-neutral-400 uppercase tracking-wider">Patrimonio Neto Total</span>
+                                    <div className="text-3xl md:text-5xl font-black text-white mt-1">
+                                        {formatearMoneda(totales.patrimonioNeto)} {!ocultarSaldos && <span className="text-xs font-normal text-neutral-500">COP</span>}
+                                    </div>
+
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-6 pt-4 border-t border-neutral-800">
+                                        <div className="bg-black p-4 rounded-xl border border-neutral-800">
+                                            <div className="text-xs text-neutral-400">💰 Disponible Real</div>
+                                            <div className="text-xl font-black text-emerald-400 mt-1">{formatearMoneda(totales.disponibleReal)}</div>
+                                            <div className="text-[10px] text-neutral-500 mt-0.5">Saldo bruto menos destinaciones</div>
+                                        </div>
+                                        <div className="bg-black p-4 rounded-xl border border-neutral-800">
+                                            <div className="text-xs text-neutral-400">🎯 Fondos Destinados</div>
+                                            <div className="text-xl font-black text-white mt-1">{formatearMoneda(totales.totalDestinado)}</div>
+                                            <div className="text-[10px] text-neutral-500 mt-0.5">Reservado en destinaciones</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                    <div className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl">
+                                        <div className="text-xs text-neutral-400 font-semibold">📈 Inversiones</div>
+                                        <div className="text-lg font-bold text-emerald-400 mt-1">{formatearMoneda(totales.inversiones)}</div>
+                                    </div>
+                                    <div className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl">
+                                        <div className="text-xs text-neutral-400 font-semibold">🟢 Me Deben</div>
+                                        <div className="text-lg font-bold text-emerald-400 mt-1">{formatearMoneda(totales.porCobrar)}</div>
+                                    </div>
+                                    <div className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl">
+                                        <div className="text-xs text-neutral-400 font-semibold">🔴 Total Deudas</div>
+                                        <div className="text-lg font-bold text-red-500 mt-1">{formatearMoneda(totales.deudas)}</div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* CUENTAS Y SALDOS DE CADA UNA */}
+                        {rubroActivo === 'cuentas' && (
+                            <div className="space-y-4">
+                                <div className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl flex justify-between items-center">
+                                    <div>
+                                        <div className="text-xs text-neutral-400">Saldo Total Bruto en Cuentas</div>
+                                        <div className="text-2xl font-black text-white mt-0.5">{formatearMoneda(totales.saldoBruto)}</div>
+                                    </div>
+                                    <div className="text-right">
+                                        <div className="text-xs text-neutral-400">Disponible Libre Real</div>
+                                        <div className="text-lg font-black text-emerald-400">{formatearMoneda(totales.disponibleReal)}</div>
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                                    {listaCuentas.map(c => (
+                                        <div key={c.id} className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl space-y-3">
+                                            <div className="flex justify-between items-center">
+                                                <div>
+                                                    <span className="text-[10px] font-bold text-neutral-500 uppercase">{c.tipo}</span>
+                                                    <h3 className="font-bold text-white text-base">{c.nombre}</h3>
+                                                </div>
+                                                <div className="text-lg font-black text-emerald-400">{formatearMoneda(c.saldo)}</div>
+                                            </div>
+                                            <button onClick={() => { setFormAjusteSaldo({ cuentaId: c.id, nuevoSaldo: c.saldo }); setModalVisible('ajusteSaldo'); }} className="w-full text-center text-[11px] font-bold text-neutral-400 hover:text-white bg-black/60 hover:bg-black py-1.5 rounded-lg border border-neutral-800 transition">
+                                                ⚙️ Ajustar Saldo
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* DESTINACIÓN DE FONDOS */}
+                        {rubroActivo === 'destinaciones' && (
+                            <div className="space-y-4">
+                                <div className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl flex justify-between items-center">
+                                    <div>
+                                        <div className="text-xs text-neutral-400">Total Reservado en Destinaciones</div>
+                                        <div className="text-xl font-black text-white mt-0.5">{formatearMoneda(totales.totalDestinado)}</div>
+                                    </div>
+                                    <button onClick={() => { setFormDestino({ id: null, nombre: '', monto: '', descripcion: '' }); setModalVisible('destinacion'); }} className="bg-emerald-500 hover:bg-emerald-400 text-neutral-950 text-xs font-extrabold px-3.5 py-2 rounded-xl">
+                                        + Destinar
+                                    </button>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    {(!datos.destinaciones || datos.destinaciones.length === 0) ? (
+                                        <div className="col-span-full text-neutral-500 italic text-center py-8 bg-neutral-900/40 border border-neutral-800 rounded-2xl text-xs">Sin destinaciones configuradas.</div>
+                                    ) : (
+                                        datos.destinaciones.map(d => (
+                                            <div key={d.id} className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl space-y-3">
+                                                <div className="flex justify-between items-start">
+                                                    <div>
+                                                        <h4 className="font-bold text-white text-base">{d.nombre}</h4>
+                                                        <p className="text-xs text-neutral-400">{d.descripcion || 'Sin nota'}</p>
+                                                    </div>
+                                                    <div className="space-x-2">
+                                                        <button onClick={() => { setFormDestino({ id: d.id, nombre: d.nombre, monto: d.monto, descripcion: d.descripcion || '' }); setModalVisible('destinacion'); }} className="text-neutral-400 text-xs font-bold hover:underline">Editar</button>
+                                                        <button onClick={() => eliminarDestinacion(d.id)} className="text-red-500 text-xs font-bold hover:underline">Eliminar</button>
+                                                    </div>
+                                                </div>
+
+                                                <div className="flex justify-between items-end border-t border-neutral-800 pt-2">
+                                                    <span className="text-xs text-neutral-400 font-semibold">Monto Reservado</span>
+                                                    <div className="text-xl font-black text-emerald-400">{formatearMoneda(d.monto)}</div>
+                                                </div>
+
+                                                <button onClick={() => { setFormEjecutarDestino({ destinacionId: d.id, cuentaId: listaCuentas[0]?.id || 'c1', monto: d.monto, fechaHora: obtenerFechaHoraActual() }); setModalVisible('ejecutarDestinacion'); }} className="w-full bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 text-xs font-extrabold py-2.5 rounded-xl border border-emerald-500/30 transition">
+                                                    ⚡ Pagar / Ejecutar Gasto (Descuenta y Libera)
+                                                </button>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* MIS DEUDAS */}
+                        {rubroActivo === 'deudas' && (
+                            <div className="space-y-4">
+                                <div className="flex justify-between items-center">
+                                    <h3 className="text-sm font-bold text-neutral-300">Mis Deudas</h3>
+                                    <button onClick={() => { setFormDeuda({ id: null, entidad: '', concepto: '', montoOriginal: '', fechaVencimiento: '', fechaHora: obtenerFechaHoraActual() }); setModalVisible('deuda'); }} className="bg-red-600 hover:bg-red-500 text-white text-xs font-bold px-3.5 py-2 rounded-xl">
+                                        + Deuda
+                                    </button>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    {(!datos.deudas || datos.deudas.length === 0) ? (
+                                        <div className="col-span-full text-neutral-500 italic text-center py-8 bg-neutral-900/40 border border-neutral-800 rounded-2xl text-xs">No tienes deudas activas.</div>
+                                    ) : (
+                                        datos.deudas.map(d => {
+                                            const totalAbonado = (d.abonos || []).reduce((acc, p) => acc + p.monto, 0);
+                                            const pendiente = Math.max(0, d.montoOriginal - totalAbonado);
+                                            const alerta = calcularAlertaVencimiento(d.fechaVencimiento);
+
+                                            return (
+                                                <div key={d.id} className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl space-y-3">
+                                                    <div className="flex justify-between items-start">
+                                                        <div>
+                                                            <div className="flex items-center gap-2">
+                                                                <h4 className="font-bold text-white text-base">{d.entidad}</h4>
+                                                                {alerta && <span className={`text-[9px] font-extrabold px-2 py-0.5 rounded-full border ${alerta.clase}`}>{alerta.texto}</span>}
+                                                            </div>
+                                                            <p className="text-xs text-neutral-400">{d.concepto}</p>
+                                                        </div>
+                                                        <div className="space-x-2">
+                                                            <button onClick={() => { setFormDeuda({ id: d.id, entidad: d.entidad, concepto: d.concepto, montoOriginal: d.montoOriginal, fechaVencimiento: d.fechaVencimiento, fechaHora: d.fechaHora }); setModalVisible('deuda'); }} className="text-xs text-neutral-400 font-bold hover:underline">Editar</button>
+                                                            <button onClick={() => eliminarDeuda(d.id)} className="text-xs text-red-500 font-bold hover:underline">Eliminar</button>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="flex justify-between items-end border-t border-neutral-800 pt-2">
+                                                        <div>
+                                                            <div className="text-[11px] text-neutral-400">Saldo Pendiente</div>
+                                                            <div className="text-xl font-black text-red-500">{formatearMoneda(pendiente)}</div>
+                                                        </div>
+                                                        <div className="text-right text-xs">
+                                                            <div className="text-neutral-400">Original</div>
+                                                            <div className="font-bold text-neutral-200">{formatearMoneda(d.montoOriginal)}</div>
+                                                        </div>
+                                                    </div>
+
+                                                    <button onClick={() => { setFormAbonoDeuda({ deudaId: d.id, cuentaId: listaCuentas[0]?.id || 'c1', monto: '', fechaHora: obtenerFechaHoraActual() }); setModalVisible('abonoDeuda'); }} className="w-full bg-red-600/10 hover:bg-red-600/20 text-red-500 text-xs font-bold py-2 rounded-xl border border-red-600/30 transition">
+                                                        + Registrar Abono (Sale Dinero)
+                                                    </button>
+                                                </div>
+                                            );
+                                        })
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* ME DEBEN */}
+                        {rubroActivo === 'porCobrar' && (
+                            <div className="space-y-4">
+                                <div className="flex justify-between items-center">
+                                    <h3 className="text-sm font-bold text-neutral-300">Préstamos / Me Deben</h3>
+                                    <button onClick={() => { setFormPorCobrar({ id: null, deudor: '', concepto: '', montoOriginal: '', fechaAcordada: '', fechaHora: obtenerFechaHoraActual() }); setModalVisible('porCobrar'); }} className="bg-emerald-500 hover:bg-emerald-400 text-neutral-950 text-xs font-extrabold px-3.5 py-2 rounded-xl">
+                                        + Préstamo
+                                    </button>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    {(!datos.porCobrar || datos.porCobrar.length === 0) ? (
+                                        <div className="col-span-full text-neutral-500 italic text-center py-8 bg-neutral-900/40 border border-neutral-800 rounded-2xl text-xs">Nadie te debe dinero.</div>
+                                    ) : (
+                                        datos.porCobrar.map(r => {
+                                            const totalAbonado = (r.abonos || []).reduce((acc, p) => acc + p.monto, 0);
+                                            const pendiente = Math.max(0, r.montoOriginal - totalAbonado);
+                                            const alerta = calcularAlertaVencimiento(r.fechaAcordada);
+
+                                            return (
+                                                <div key={r.id} className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl space-y-3">
+                                                    <div className="flex justify-between items-start">
+                                                        <div>
+                                                            <div className="flex items-center gap-2">
+                                                                <h4 className="font-bold text-white text-base">{r.deudor}</h4>
+                                                                {alerta && <span className={`text-[9px] font-extrabold px-2 py-0.5 rounded-full border ${alerta.clase}`}>{alerta.texto}</span>}
+                                                            </div>
+                                                            <p className="text-xs text-neutral-400">{r.concepto}</p>
+                                                        </div>
+                                                        <div className="space-x-2">
+                                                            <button onClick={() => { setFormPorCobrar({ id: r.id, deudor: r.deudor, concepto: r.concepto, montoOriginal: r.montoOriginal, fechaAcordada: r.fechaAcordada, fechaHora: r.fechaHora }); setModalVisible('porCobrar'); }} className="text-xs text-neutral-400 font-bold hover:underline">Editar</button>
+                                                            <button onClick={() => eliminarPorCobrar(r.id)} className="text-xs text-red-500 font-bold hover:underline">Eliminar</button>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="flex justify-between items-end border-t border-neutral-800 pt-2">
+                                                        <div>
+                                                            <div className="text-[11px] text-neutral-400">Saldo por Cobrar</div>
+                                                            <div className="text-xl font-black text-emerald-400">{formatearMoneda(pendiente)}</div>
+                                                        </div>
+                                                        <div className="text-right text-xs">
+                                                            <div className="text-neutral-400">Original</div>
+                                                            <div className="font-bold text-neutral-200">{formatearMoneda(r.montoOriginal)}</div>
+                                                        </div>
+                                                    </div>
+
+                                                    <button onClick={() => { setFormAbonoCobro({ cobroId: r.id, cuentaId: listaCuentas[0]?.id || 'c1', monto: '', fechaHora: obtenerFechaHoraActual() }); setModalVisible('abonoCobro'); }} className="w-full bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 text-xs font-bold py-2 rounded-xl border border-emerald-500/30 transition">
+                                                        + Registrar Pago Recibido (Entra Dinero)
+                                                    </button>
+                                                </div>
+                                            );
+                                        })
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* MOVIMIENTOS */}
+                        {rubroActivo === 'movimientos' && (
+                            <div className="space-y-4">
+                                <div className="flex flex-col sm:flex-row gap-2 justify-between items-center bg-neutral-900 border border-neutral-800 p-3 rounded-2xl">
+                                    <input
+                                        type="text"
+                                        placeholder="🔍 Buscar por concepto o cuenta..."
+                                        value={busquedaMov}
+                                        onChange={e => setBusquedaMov(e.target.value)}
+                                        className="w-full sm:w-1/2 bg-black border border-neutral-800 text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-emerald-500"
+                                    />
+                                    <div className="flex w-full sm:w-auto gap-2">
+                                        <select
+                                            value={filtroFechaMov}
+                                            onChange={e => setFiltroFechaMov(e.target.value)}
+                                            className="bg-black border border-neutral-800 text-white text-xs font-bold rounded-xl px-3 py-2 focus:outline-none"
+                                        >
+                                            <option value="todos">🗓️ Todo el Historial</option>
+                                            <option value="mes_actual">🗓️ Mes Actual</option>
+                                            <option value="mes_anterior">🗓️ Mes Anterior</option>
+                                            <option value="ano_actual">🗓️ Año Actual</option>
+                                        </select>
+                                        <button onClick={exportarCSV} className="bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-3 py-2 rounded-xl text-xs font-bold transition">
+                                            📥 CSV
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div className="space-y-2">
+                                    {movimientosFiltrados.length === 0 ? (
+                                        <div className="text-neutral-500 italic text-center py-8 bg-neutral-900/40 border border-neutral-800 rounded-2xl text-xs">Sin movimientos que coincidan con la búsqueda.</div>
+                                    ) : (
+                                        movimientosFiltrados.map(m => {
+                                            const c = listaCuentas.find(cuenta => cuenta.id === m.cuentaId);
+                                            const esIngreso = m.tipo === 'ingreso';
+                                            const esTransferencia = m.tipo === 'transferencia';
+
+                                            return (
+                                                <div key={m.id} className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl flex justify-between items-center">
+                                                    <div className="space-y-0.5">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className={`w-2.5 h-2.5 rounded-full ${esTransferencia ? 'bg-amber-400' : esIngreso ? 'bg-emerald-400' : 'bg-red-500'}`}></span>
+                                                            <h4 className="font-bold text-white text-sm">{m.concepto}</h4>
+                                                        </div>
+                                                        <p className="text-[11px] text-neutral-400">
+                                                            <span className="font-bold text-neutral-300">{c ? c.nombre : 'Cuenta general'}</span> • <span className="font-mono">{formatearFechaHora(m.fechaHora)}</span>
+                                                        </p>
+                                                    </div>
+                                                    <div className="text-right">
+                                                        <div className={`text-base font-black ${esTransferencia ? 'text-amber-400' : esIngreso ? 'text-emerald-400' : 'text-red-500'}`}>
+                                                            {esTransferencia ? '⇄ ' : esIngreso ? '+' : '-'}{formatearMoneda(m.monto)}
+                                                        </div>
+                                                        <button onClick={() => eliminarMovimiento(m.id)} className="text-[10px] text-neutral-500 hover:text-red-500 underline mt-1">Eliminar</button>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* CIERRE DE MES */}
+                        {rubroActivo === 'cierres' && (
+                            <div className="space-y-4">
+                                <div className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl space-y-3">
+                                    <h3 className="font-bold text-white text-base">Guardar Cierre de Mes</h3>
+                                    <p className="text-xs text-neutral-400">Guarda un reporte estático de tu patrimonio neto y disponibles actuales.</p>
+                                    <button onClick={() => setModalVisible('cierre')} className="w-full bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-extrabold text-xs py-3 rounded-xl transition">
+                                        🔒 Realizar Cierre Mensual
+                                    </button>
+                                </div>
+
+                                <div className="space-y-3 pt-2">
+                                    <h4 className="text-xs font-bold text-neutral-400 uppercase tracking-wider">Historial de Cierres</h4>
+                                    {(!datos.cierresMensuales || datos.cierresMensuales.length === 0) ? (
+                                        <div className="text-neutral-500 italic text-center py-8 bg-neutral-900/40 border border-neutral-800 rounded-2xl text-xs">Sin cierres guardados.</div>
+                                    ) : (
+                                        datos.cierresMensuales.map(c => (
+                                            <div key={c.id} className="bg-neutral-900 border border-neutral-800 p-4 rounded-2xl space-y-2">
+                                                <div className="flex justify-between items-center border-b border-neutral-800 pb-2">
+                                                    <h5 className="font-bold text-emerald-400 text-base">{c.nombreMes}</h5>
+                                                    <span className="text-[10px] font-mono text-neutral-500">{formatearFechaHora(c.fechaCierre)}</span>
+                                                </div>
+                                                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs pt-1">
+                                                    <div>
+                                                        <span className="text-neutral-400">Patrimonio:</span>
+                                                        <div className="font-bold text-white">{formatearMoneda(c.resumen.patrimonioNeto)}</div>
+                                                    </div>
+                                                    <div>
+                                                        <span className="text-neutral-400">Disponible Real:</span>
+                                                        <div className="font-bold text-emerald-400">{formatearMoneda(c.resumen.disponibleReal)}</div>
+                                                    </div>
+                                                    <div>
+                                                        <span className="text-neutral-400">Destinado:</span>
+                                                        <div className="font-bold text-neutral-200">{formatearMoneda(c.resumen.totalDestinado)}</div>
+                                                    </div>
+                                                    <div>
+                                                        <span className="text-neutral-400">Deudas:</span>
+                                                        <div className="font-bold text-red-500">{formatearMoneda(c.resumen.deudas)}</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                    </main>
+
+                    {/* MODALES */}
+                    {modalVisible === 'movimiento' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={guardarMovimiento} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">{formMov.id ? 'Editar Movimiento' : 'Nuevo Movimiento'}</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Fecha y Hora</label>
+                                    <input type="datetime-local" required value={formMov.fechaHora} onChange={e => setFormMov({ ...formMov, fechaHora: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Tipo de Transacción</label>
+                                    <select value={formMov.tipo} onChange={e => setFormMov({ ...formMov, tipo: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold">
+                                        <option value="ingreso" className="text-emerald-400">🟢 Entra Dinero (Ingreso)</option>
+                                        <option value="egreso" className="text-red-500">🔴 Sale Dinero (Egreso)</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-emerald-400 font-bold">Cuenta</label>
+                                    <select value={formMov.cuentaId} onChange={e => setFormMov({ ...formMov, cuentaId: e.target.value })} className="w-full bg-black border border-emerald-500/50 text-white font-bold rounded-xl p-3 mt-1">
+                                        {listaCuentas.map(c => (
+                                            <option key={c.id} value={c.id}>
+                                                {c.nombre} (Saldo actual: {formatearMoneda(c.saldo)})
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Concepto</label>
+                                    <input type="text" required placeholder="Ej: Pago de nómina, Compras, Mercado" value={formMov.concepto} onChange={e => setFormMov({ ...formMov, concepto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Monto (COP)</label>
+                                    <input type="number" required placeholder="0" value={formMov.monto} onChange={e => setFormMov({ ...formMov, monto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold text-lg" />
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-emerald-500 text-neutral-950 py-3 rounded-xl font-extrabold">Guardar</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'transferencia' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={realizarTransferencia} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">⇄ Transferir entre Cuentas</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Cuenta Origen (Sale)</label>
+                                    <select value={formTransfer.cuentaOrigenId} onChange={e => setFormTransfer({ ...formTransfer, cuentaOrigenId: e.target.value })} className="w-full bg-black border border-neutral-800 text-white font-bold rounded-xl p-3 mt-1">
+                                        {listaCuentas.map(c => <option key={c.id} value={c.id}>{c.nombre} ({formatearMoneda(c.saldo)})</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-emerald-400 font-bold">Cuenta Destino (Entra)</label>
+                                    <select value={formTransfer.cuentaDestinoId} onChange={e => setFormTransfer({ ...formTransfer, cuentaDestinoId: e.target.value })} className="w-full bg-black border border-emerald-500/50 text-white font-bold rounded-xl p-3 mt-1">
+                                        {listaCuentas.map(c => <option key={c.id} value={c.id}>{c.nombre} ({formatearMoneda(c.saldo)})</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Monto a Transferir (COP)</label>
+                                    <input type="number" required placeholder="0" value={formTransfer.monto} onChange={e => setFormTransfer({ ...formTransfer, monto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold text-lg" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Nota / Motivo</label>
+                                    <input type="text" placeholder="Ej: Recarga, retiro efectivo" value={formTransfer.concepto} onChange={e => setFormTransfer({ ...formTransfer, concepto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-amber-500 text-neutral-950 py-3 rounded-xl font-extrabold">Transferir</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'ajusteSaldo' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={guardarAjusteSaldo} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">⚙️ Calibrar Saldo Inicial</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Cuenta</label>
+                                    <div className="font-bold text-emerald-400 text-base py-1">
+                                        {listaCuentas.find(c => c.id === formAjusteSaldo.cuentaId)?.nombre}
+                                    </div>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Nuevo Saldo Real (COP)</label>
+                                    <input type="number" required placeholder="0" value={formAjusteSaldo.nuevoSaldo} onChange={e => setFormAjusteSaldo({ ...formAjusteSaldo, nuevoSaldo: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold text-lg" />
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-emerald-500 text-neutral-950 py-3 rounded-xl font-extrabold">Guardar Saldo</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'destinacion' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={guardarDestinacion} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">{formDestino.id ? 'Editar Destinación' : 'Nueva Destinación'}</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Nombre del Fondo</label>
+                                    <input type="text" required placeholder="Ej: Arriendo, Mercado" value={formDestino.nombre} onChange={e => setFormDestino({ ...formDestino, nombre: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Monto a Reservar (COP)</label>
+                                    <input type="number" required placeholder="0" value={formDestino.monto} onChange={e => setFormDestino({ ...formDestino, monto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold text-lg" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Descripción</label>
+                                    <input type="text" placeholder="Observación" value={formDestino.descripcion} onChange={e => setFormDestino({ ...formDestino, descripcion: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-emerald-500 text-neutral-950 py-3 rounded-xl font-extrabold">Guardar</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'ejecutarDestinacion' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={ejecutarPagoDestinacion} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">⚡ Pagar / Ejecutar Gasto</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Monto a Pagar (COP)</label>
+                                    <input type="number" required placeholder="0" value={formEjecutarDestino.monto} onChange={e => setFormEjecutarDestino({ ...formEjecutarDestino, monto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold text-lg" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-emerald-400 font-bold">Cuenta de donde sale el dinero real</label>
+                                    <select value={formEjecutarDestino.cuentaId} onChange={e => setFormEjecutarDestino({ ...formEjecutarDestino, cuentaId: e.target.value })} className="w-full bg-black border border-emerald-500/50 text-white font-bold rounded-xl p-3 mt-1">
+                                        {listaCuentas.map(c => <option key={c.id} value={c.id}>{c.nombre} ({formatearMoneda(c.saldo)})</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Fecha y Hora</label>
+                                    <input type="datetime-local" required value={formEjecutarDestino.fechaHora} onChange={e => setFormEjecutarDestino({ ...formEjecutarDestino, fechaHora: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-emerald-500 text-neutral-950 py-3 rounded-xl font-extrabold">Confirmar Pago</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'cierre' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={realizarCierreMensual} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">🔒 Guardar Cierre de Mes</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Nombre del Mes</label>
+                                    <input type="text" required placeholder="Ej: Octubre 2026" value={nombreCierre} onChange={e => setNombreCierre(e.target.value)} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-emerald-500 text-neutral-950 py-3 rounded-xl font-extrabold">Confirmar</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'deuda' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={guardarDeuda} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">{formDeuda.id ? 'Editar Deuda' : 'Registrar Deuda'}</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">A quién le debo</label>
+                                    <input type="text" required placeholder="Ej: Banco" value={formDeuda.entidad} onChange={e => setFormDeuda({ ...formDeuda, entidad: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Concepto</label>
+                                    <input type="text" required placeholder="Ej: Préstamo" value={formDeuda.concepto} onChange={e => setFormDeuda({ ...formDeuda, concepto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Monto Original (COP)</label>
+                                    <input type="number" required placeholder="0" value={formDeuda.montoOriginal} onChange={e => setFormDeuda({ ...formDeuda, montoOriginal: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Fecha Límite de Pago (Opcional)</label>
+                                    <input type="date" value={formDeuda.fechaVencimiento} onChange={e => setFormDeuda({ ...formDeuda, fechaVencimiento: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-red-600 text-white py-3 rounded-xl font-extrabold">Guardar Deuda</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'abonoDeuda' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={abonarDeuda} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">Abonar a Deuda</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Monto del Abono (COP)</label>
+                                    <input type="number" required placeholder="0" value={formAbonoDeuda.monto} onChange={e => setFormAbonoDeuda({ ...formAbonoDeuda, monto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold text-lg" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Cuenta de Salida</label>
+                                    <select value={formAbonoDeuda.cuentaId} onChange={e => setFormAbonoDeuda({ ...formAbonoDeuda, cuentaId: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold">
+                                        {listaCuentas.map(c => <option key={c.id} value={c.id}>{c.nombre} ({formatearMoneda(c.saldo)})</option>)}
+                                    </select>
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-red-600 text-white py-3 rounded-xl font-extrabold">Registrar Pago</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'porCobrar' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={guardarPorCobrar} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">{formPorCobrar.id ? 'Editar Préstamo' : 'Registrar Me Deben'}</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Quién me debe</label>
+                                    <input type="text" required placeholder="Ej: Carlos" value={formPorCobrar.deudor} onChange={e => setFormPorCobrar({ ...formPorCobrar, deudor: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Concepto</label>
+                                    <input type="text" required placeholder="Ej: Préstamo" value={formPorCobrar.concepto} onChange={e => setFormPorCobrar({ ...formPorCobrar, concepto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Monto Original (COP)</label>
+                                    <input type="number" required placeholder="0" value={formPorCobrar.montoOriginal} onChange={e => setFormPorCobrar({ ...formPorCobrar, montoOriginal: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Fecha Acordada de Pago (Opcional)</label>
+                                    <input type="date" value={formPorCobrar.fechaAcordada} onChange={e => setFormPorCobrar({ ...formPorCobrar, fechaAcordada: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1" />
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-emerald-500 text-neutral-950 py-3 rounded-xl font-extrabold">Guardar</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {modalVisible === 'abonoCobro' && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 overflow-y-auto">
+                            <form onSubmit={recibirAbonoCobro} className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl max-w-md w-full space-y-4 my-auto">
+                                <h3 className="font-bold text-white text-lg">Registrar Pago Recibido</h3>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Monto Recibido (COP)</label>
+                                    <input type="number" required placeholder="0" value={formAbonoCobro.monto} onChange={e => setFormAbonoCobro({ ...formAbonoCobro, monto: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold text-lg" />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-neutral-400">Cuenta de Ingreso</label>
+                                    <select value={formAbonoCobro.cuentaId} onChange={e => setFormAbonoCobro({ ...formAbonoCobro, cuentaId: e.target.value })} className="w-full bg-black border border-neutral-800 text-white rounded-xl p-3 mt-1 font-bold">
+                                        {listaCuentas.map(c => <option key={c.id} value={c.id}>{c.nombre} ({formatearMoneda(c.saldo)})</option>)}
+                                    </select>
+                                </div>
+                                <div className="flex gap-2 pt-2">
+                                    <button type="button" onClick={() => setModalVisible(null)} className="w-1/2 bg-black text-neutral-300 py-3 rounded-xl font-bold border border-neutral-800">Cancelar</button>
+                                    <button type="submit" className="w-1/2 bg-emerald-500 text-neutral-950 py-3 rounded-xl font-extrabold">Registrar</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<Aplicacion/>);
+    </script>
+</body>
+</html>
